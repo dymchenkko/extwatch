@@ -1,0 +1,7 @@
+# Compiled binary
+/extwatch
+
+# Test/build artifacts
+*.out
+*.test
+SHOW_HN.md
