@@ -12,12 +12,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,6 +27,7 @@ import (
 	"github.com/dymchenkko/extwatch/internal/extension"
 	"github.com/dymchenkko/extwatch/internal/fetcher"
 	"github.com/dymchenkko/extwatch/internal/notifier"
+	"github.com/dymchenkko/extwatch/internal/vsconfig"
 	"github.com/dymchenkko/extwatch/internal/watcher"
 )
 
@@ -46,7 +49,21 @@ func run() error {
 		return err
 	}
 	dir := flag.String("dir", defaultDir, "VS Code extensions directory to watch")
+	disableAU := flag.Bool("disable-autoupdate", false,
+		"detect VS Code extension auto-update and offer to disable it, then exit")
+	assumeYes := flag.Bool("yes", false, "answer yes to prompts (non-interactive)")
 	flag.Parse()
+
+	// --disable-autoupdate is a standalone action: do it and exit without
+	// starting the watcher. It's the prerequisite for any preventive vetting —
+	// while VS Code auto-updates, new versions land before we can inspect them.
+	if *disableAU {
+		return ensureManualUpdates(*assumeYes)
+	}
+
+	// In normal watch mode, warn (but don't block) if auto-update is still on,
+	// since that undercuts what the watcher is for.
+	warnIfAutoUpdating()
 
 	w, err := watcher.New(*dir)
 	if err != nil {
@@ -129,4 +146,86 @@ func defaultExtensionsDir() (string, error) {
 		return "", fmt.Errorf("resolve home directory: %w", err)
 	}
 	return filepath.Join(home, ".vscode", "extensions"), nil
+}
+
+// ensureManualUpdates walks every discovered VS Code-family editor and, where
+// extension auto-update is still enabled, explains the risk and (interactively,
+// unless assumeYes) disables it by editing settings.json. Declining prints the
+// manual steps instead.
+func ensureManualUpdates(assumeYes bool) error {
+	profiles := vsconfig.DiscoverProfiles()
+	if len(profiles) == 0 {
+		fmt.Println("extwatch: no VS Code-family settings.json found; nothing to do")
+		return nil
+	}
+
+	for _, p := range profiles {
+		state, err := vsconfig.ReadAutoUpdate(p.Path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "extwatch: %s: cannot read settings (%v); skipping\n", p.Editor, err)
+			continue
+		}
+		if !state.Enabled() {
+			fmt.Printf("extwatch: %s — auto-update already disabled ✓\n", p.Editor)
+			continue
+		}
+
+		fmt.Printf("\nextwatch: %s has extension auto-update %s\n", p.Editor, state)
+		fmt.Printf("  %s\n", p.Path)
+		fmt.Println("  While this is on, VS Code installs new extension versions before extwatch")
+		fmt.Println("  can vet them — the malicious code is already on disk by the time we look.")
+
+		if !assumeYes && !confirm(fmt.Sprintf("  Disable auto-update for %s now?", p.Editor)) {
+			printManualInstructions()
+			continue
+		}
+
+		backup, err := vsconfig.DisableAutoUpdate(p.Path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  extwatch: failed to update settings: %v\n", err)
+			continue
+		}
+		fmt.Printf("  ✓ set extensions.autoUpdate = false")
+		if backup != "" {
+			fmt.Printf(" (backup: %s)", backup)
+		}
+		fmt.Println()
+		fmt.Println("  Reload the window or restart the editor for it to take effect.")
+	}
+	return nil
+}
+
+// warnIfAutoUpdating prints a single non-fatal advisory if any editor still
+// auto-updates extensions.
+func warnIfAutoUpdating() {
+	var on []string
+	for _, p := range vsconfig.DiscoverProfiles() {
+		if state, err := vsconfig.ReadAutoUpdate(p.Path); err == nil && state.Enabled() {
+			on = append(on, p.Editor)
+		}
+	}
+	if len(on) > 0 {
+		fmt.Printf("extwatch: warning: extension auto-update is enabled for %s; updates install "+
+			"before extwatch can vet them.\n  Run 'extwatch --disable-autoupdate' to fix.\n",
+			strings.Join(on, ", "))
+	}
+}
+
+// confirm asks a yes/no question on stdin, defaulting to no.
+func confirm(prompt string) bool {
+	fmt.Printf("%s [y/N] ", prompt)
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// printManualInstructions tells the user how to disable auto-update themselves.
+func printManualInstructions() {
+	fmt.Println("  Leaving it unchanged. To disable it yourself:")
+	fmt.Println("    Settings UI:  search \"extensions.autoUpdate\" and set it to \"None\"")
+	fmt.Println("    settings.json: add  \"extensions.autoUpdate\": false")
 }
