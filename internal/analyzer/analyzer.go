@@ -7,10 +7,10 @@ package analyzer
 import (
 	"encoding/json"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/dymchenkko/extwatch/internal/astscanner"
 	"github.com/dymchenkko/extwatch/internal/extension"
 )
 
@@ -47,83 +47,48 @@ func (s Severity) weight() int {
 	}
 }
 
-// Pattern is one rule: a compiled regexp, what it means, and how bad it is.
+// Pattern is one detected rule: its name, severity, and a human-readable
+// description. The regex fields from the previous implementation have been
+// removed — detection is now performed by the AST scanner.
 type Pattern struct {
 	Name     string
 	Severity Severity
 	Desc     string
-	re       *regexp.Regexp
-
-	// reqRe, if set, gates the pattern: a match only counts in a file where
-	// reqRe also matches. We use it to require an actual `child_process` import
-	// before treating exec()/spawn() as shelling out — otherwise innocent
-	// `regex.exec(...)` calls (a RegExp method) in minified libraries like d3
-	// produce a flood of false positives.
-	reqRe *regexp.Regexp
 }
 
-// patterns is the detection catalogue. Each entry maps a regexp to a severity,
-// optionally gated by a "requires" expression (see Pattern.reqRe). Notes on a
-// couple of regexp choices:
-//   - `\bexec\s*\(` deliberately does NOT match `execSync(` (after "exec" comes
-//     "Sync", not "("), so exec and execSync stay distinct findings.
-//   - the URL regexp uses \x60 to mean a literal backtick, which can't appear
-//     inside a Go raw-string literal.
-var patterns = buildPatterns([]patternSpec{
-	// --- HIGH: code execution / shelling out -------------------------------
-	// exec/execSync/spawn require a child_process import in the same file, so
-	// RegExp.prototype.exec() and unrelated spawn() helpers don't false-positive.
-	{"child_process", "Imports Node's child_process module (run OS commands)", `child_process`, SeverityHigh, ""},
-	{"exec(", "Calls exec() to run a shell command", `\bexec\s*\(`, SeverityHigh, `child_process`},
-	{"execSync(", "Calls execSync() to run a shell command synchronously", `\bexecSync\s*\(`, SeverityHigh, `child_process`},
-	{"spawn(", "Spawns a child process", `\bspawn\s*\(`, SeverityHigh, `child_process`},
-	// --- HIGH: dynamic code evaluation -------------------------------------
-	{"eval(", "Evaluates a string as code", `\beval\s*\(`, SeverityHigh, ""},
-	{"new Function(", "Builds a function from a string (eval-equivalent)", `new\s+Function\s*\(`, SeverityHigh, ""},
-	// --- HIGH: credential / sensitive path access --------------------------
-	{".ssh", "References the user's SSH directory", `\.ssh\b`, SeverityHigh, ""},
-	{".aws", "References the user's AWS credentials directory", `\.aws\b`, SeverityHigh, ""},
-	{"USERPROFILE", "Reads the Windows USERPROFILE path", `USERPROFILE`, SeverityHigh, ""},
-	// --- MEDIUM: environment + network -------------------------------------
-	{"process.env", "Reads process environment variables", `process\.env`, SeverityMedium, ""},
-	{"fetch(", "Makes an outbound HTTP request via fetch()", `\bfetch\s*\(`, SeverityMedium, ""},
-	{"WebSocket", "Opens a WebSocket connection", `WebSocket`, SeverityMedium, ""},
-	{"outbound URL", "Hard-coded outbound URL", `https?://[^\s"'\x60)\]]+`, SeverityMedium, ""},
-	// --- LOW ----------------------------------------------------------------
-	{"clipboard", "Accesses the system clipboard", `(?i)clipboard`, SeverityLow, ""},
-})
-
-// patternSpec is the source form of a rule before compilation. requires is an
-// optional regexp that must also be present in a file for the rule to fire.
-type patternSpec struct {
-	name, desc, expr string
-	sev              Severity
-	requires         string
-}
-
-// buildPatterns compiles the rule table once at package init. regexp.MustCompile
-// is acceptable here because the expressions are constant: a bad regexp is a
-// programmer bug, surfaced immediately at startup rather than at runtime.
-func buildPatterns(specs []patternSpec) []Pattern {
-	out := make([]Pattern, 0, len(specs))
-	for _, s := range specs {
-		p := Pattern{
-			Name:     s.name,
-			Severity: s.sev,
-			Desc:     s.desc,
-			re:       regexp.MustCompile(s.expr),
-		}
-		if s.requires != "" {
-			p.reqRe = regexp.MustCompile(s.requires)
-		}
-		out = append(out, p)
-	}
-	return out
+// astPatternDesc maps AST scanner pattern names to human-readable descriptions
+// for the report output.
+var astPatternDesc = map[string]string{
+	"exec(":               "Calls exec() to run a shell command",
+	"execSync(":           "Calls execSync() to run a shell command synchronously",
+	"spawn(":              "Spawns a child process",
+	"spawnSync(":          "Spawns a child process synchronously",
+	"eval(":               "Evaluates a string as code",
+	"new Function(":       "Builds a function from a string (eval-equivalent)",
+	"runInNewContext(":    "Executes code in a new vm context (eval-equivalent)",
+	"runInThisContext(":   "Executes code in the current vm context (eval-equivalent)",
+	"setTimeout(string)":  "Evaluates a string argument via setTimeout (eval-equivalent)",
+	"setInterval(string)": "Evaluates a string argument via setInterval (eval-equivalent)",
+	"process.env":         "Reads process environment variables",
+	".ssh":                "References the user's SSH directory",
+	".aws":                "References the user's AWS credentials directory",
+	".npmrc":              "References the user's npm auth token file",
+	".kube":               "References the user's Kubernetes credentials directory",
+	".docker":             "References the user's Docker credentials",
+	"fetch(":              "Makes an outbound HTTP request via fetch()",
+	"https.request(":      "Makes an outbound HTTPS request via Node's https module",
+	"http.request(":       "Makes an outbound HTTP request via Node's http module",
+	"createConnection(":   "Opens a raw TCP socket via Node's net module",
+	"WebSocket":           "Opens a WebSocket connection",
+	"XMLHttpRequest":      "Makes an HTTP request via XMLHttpRequest",
+	"createTerminal(":     "Creates a hidden VS Code terminal to run shell commands",
 }
 
 // Finding is a single pattern match located in a specific file.
 type Finding struct {
 	Pattern Pattern
+	Module  string // resolved require() module, e.g. "child_process"; "" for globals
+	Arg     string // first string-literal argument, "" if not applicable
 	File    string // relative path within the extension
 	Line    int    // 1-based line number of the match
 	Snippet string // trimmed/truncated line containing the match (for display)
@@ -143,11 +108,6 @@ type Result struct {
 	Introduced      []Finding // patterns present in new version but not the old
 }
 
-// maxMatchesPerPatternFile bounds how many example matches we keep for a single
-// pattern in a single file, so a minified blob with thousands of "process.env"
-// hits doesn't drown the report.
-const maxMatchesPerPatternFile = 3
-
 // snippetMax truncates very long lines (minified bundles are often one giant
 // line) so the report stays readable.
 const snippetMax = 160
@@ -156,7 +116,7 @@ const snippetMax = 160
 // mega-line. At or below it we diff the exact line text (precise: catches a new
 // malicious call site even when the pattern itself is old). Above it, line-level
 // diffing is meaningless — one changed bundle line would flag everything — so we
-// fall back to coarse pattern-presence for that match.
+// fall back to AST-signature diffing (see findingSet / introduced).
 const maxDiffLineLen = 300
 
 // Analyze scans the new version's JS for dangerous patterns and keeps only what
@@ -164,11 +124,15 @@ const maxDiffLineLen = 300
 //
 //  1. it lives in a file that did not exist in the previous version, OR
 //  2. (readable line) its exact line text is absent from the previous version, OR
-//  3. (minified line) its pattern was absent from the previous version entirely.
+//  3. (minified line) its (pattern, module, arg) signature is absent from the
+//     same file in the previous version.
 //
-// This catches a malicious *new use* of a pattern the extension already used
-// (e.g. a fresh spawn('/bin/sh') alongside a legitimate spawn(server)), which a
-// coarse "is the pattern anywhere in old?" check would miss.
+// Rule 3 handles minified bundles where everything is on one giant line.
+// Because variable names are mangled by bundlers (cp → a, b, c between versions),
+// we cannot compare line text. Instead we compare what the AST scanner resolved:
+// the pattern name ("exec("), the module it came from ("child_process"), and the
+// first string argument ("whoami"). Two calls with identical signatures in the
+// same file are considered the same call; a new distinct signature is flagged.
 //
 // Pass oldJS == nil when there is no baseline (first install, or the previous
 // .vsix couldn't be fetched); then every match is introduced and HasBaseline is
@@ -180,12 +144,12 @@ func Analyze(ext extension.Extension, prevVersion string, newJS, oldJS map[strin
 		HasBaseline:     oldJS != nil,
 	}
 
-	oldFiles := fileSet(oldJS)       // normalised paths present in the old version
-	oldLines := lineSet(oldJS)       // every trimmed source line in the old version
-	oldHas := patternPresence(oldJS) // pattern names anywhere in old (minified fallback)
+	oldFiles := fileSet(oldJS)    // normalised paths present in the old version
+	oldLines := lineSet(oldJS)    // every trimmed source line in the old version
+	oldSigs  := findingSet(oldJS) // per-file AST signatures for minified fallback
 
 	for _, f := range scanCorpus(newJS) {
-		if introduced(f, oldFiles, oldLines, oldHas) {
+		if introduced(f, oldFiles, oldLines, oldSigs) {
 			res.Introduced = append(res.Introduced, f)
 		}
 	}
@@ -209,16 +173,18 @@ func Analyze(ext extension.Extension, prevVersion string, newJS, oldJS map[strin
 }
 
 // introduced decides whether a finding from the new version is something the
-// update added, given the previous version's files, lines, and patterns. See
+// update added, given the previous version's files, lines, and signatures. See
 // Analyze's doc comment for the three-way rule.
-func introduced(f Finding, oldFiles, oldLines, oldHas map[string]bool) bool {
+func introduced(f Finding, oldFiles map[string]bool, oldLines map[string]bool, oldSigs map[string]map[string]bool) bool {
 	if !oldFiles[normPath(f.File)] {
 		return true // the whole file is new in this version
 	}
 	if len(f.fullLine) <= maxDiffLineLen {
 		return !oldLines[f.fullLine] // readable line: exact-line diff
 	}
-	return !oldHas[f.Pattern.Name] // minified mega-line: coarse fallback
+	// Minified mega-line: compare by (pattern, module, arg) within the same file.
+	key := f.Pattern.Name + "\x00" + f.Module + "\x00" + f.Arg
+	return !oldSigs[normPath(f.File)][key]
 }
 
 // manifest holds the package.json fields relevant to security: lifecycle
@@ -322,18 +288,22 @@ func sliceSet(xs []string) map[string]bool {
 	return set
 }
 
-// patternPresence returns the set of pattern names that match anywhere in the
-// given corpus. Returns an empty (non-nil) set for nil input.
-func patternPresence(corpus map[string]string) map[string]bool {
-	present := make(map[string]bool)
-	for _, content := range corpus {
-		for _, p := range patterns {
-			if !present[p.Name] && p.re.MatchString(content) {
-				present[p.Name] = true
-			}
+// findingSet builds a per-file set of AST finding signatures for the minified
+// diff fallback. The outer key is the normalised file path; the inner key is
+// pattern + "\x00" + module + "\x00" + arg — the same triple used by
+// introduced() to decide whether a minified-line finding is new.
+func findingSet(corpus map[string]string) map[string]map[string]bool {
+	sigs := make(map[string]map[string]bool)
+	for file, content := range corpus {
+		fp := normPath(file)
+		if sigs[fp] == nil {
+			sigs[fp] = make(map[string]bool)
+		}
+		for _, af := range astscanner.ScanFile(file, content) {
+			sigs[fp][af.Pattern+"\x00"+af.Module+"\x00"+af.Arg] = true
 		}
 	}
-	return present
+	return sigs
 }
 
 // fileSet returns the set of normalised file paths in a corpus.
@@ -367,70 +337,33 @@ func normPath(p string) string {
 	return strings.TrimPrefix(filepath.ToSlash(p), "extension/")
 }
 
-// scanCorpus finds every pattern match across all files, capturing line numbers
-// and snippets, bounded by maxMatchesPerPatternFile per pattern/file.
+// scanCorpus runs the AST scanner over every file in the corpus and converts
+// the results into analyzer Findings.
 func scanCorpus(corpus map[string]string) []Finding {
 	var findings []Finding
 	for file, content := range corpus {
-		offsets := lineOffsets(content)
-		for _, p := range patterns {
-			// Gated patterns (e.g. exec/spawn) only count when their required
-			// context (a child_process import) is present in the same file.
-			if p.reqRe != nil && !p.reqRe.MatchString(content) {
-				continue
+		for _, af := range astscanner.ScanFile(file, content) {
+			desc := astPatternDesc[af.Pattern]
+			if desc == "" {
+				desc = af.Pattern
 			}
-			locs := p.re.FindAllStringIndex(content, -1)
-			for n, loc := range locs {
-				if n >= maxMatchesPerPatternFile {
-					break
-				}
-				line := lineForOffset(offsets, loc[0])
-				full := lineText(content, offsets, line)
-				findings = append(findings, Finding{
-					Pattern:  p,
-					File:     file,
-					Line:     line,
-					Snippet:  truncate(full, snippetMax),
-					fullLine: full,
-				})
-			}
+			full := af.Snippet
+			findings = append(findings, Finding{
+				Pattern: Pattern{
+					Name:     af.Pattern,
+					Severity: Severity(af.Severity),
+					Desc:     desc,
+				},
+				Module:   af.Module,
+				Arg:      af.Arg,
+				File:     file,
+				Line:     af.Line,
+				Snippet:  truncate(full, snippetMax),
+				fullLine: full,
+			})
 		}
 	}
 	return findings
-}
-
-// lineOffsets returns the byte offset at which each line starts. offsets[0] is
-// always 0; offsets[i] is the index just after the i-th '\n'. With this we can
-// binary-search a match offset to its line number in O(log n).
-func lineOffsets(content string) []int {
-	offsets := []int{0}
-	for i := 0; i < len(content); i++ {
-		if content[i] == '\n' {
-			offsets = append(offsets, i+1)
-		}
-	}
-	return offsets
-}
-
-// lineForOffset maps a byte offset to a 1-based line number via binary search.
-func lineForOffset(offsets []int, off int) int {
-	// sort.Search finds the first line start strictly greater than off; the
-	// line containing off is the one before it.
-	i := sort.Search(len(offsets), func(i int) bool { return offsets[i] > off })
-	if i == 0 {
-		return 1
-	}
-	return i
-}
-
-// lineText returns the trimmed (untruncated) text of a 1-based line.
-func lineText(content string, offsets []int, line int) string {
-	start := offsets[line-1]
-	end := len(content)
-	if line < len(offsets) {
-		end = offsets[line] - 1 // drop the trailing '\n'
-	}
-	return strings.TrimSpace(content[start:end])
 }
 
 // truncate caps a string at n bytes, appending an ellipsis if it was cut.
