@@ -1,10 +1,107 @@
 package fetcher
 
 import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/dymchenkko/extwatch/internal/extension"
 )
+
+// makeVSIX builds a minimal in-memory .vsix (zip) with the given entries
+// (path -> content) and returns the raw bytes.
+func makeVSIX(t *testing.T, entries map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := zip.NewWriter(&buf)
+	for name, content := range entries {
+		f, err := w.Create(name)
+		if err != nil {
+			t.Fatalf("zip create %s: %v", name, err)
+		}
+		if _, err := strings.NewReader(content).WriteTo(f); err != nil {
+			t.Fatalf("zip write %s: %v", name, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestDownloadVSIX_happy(t *testing.T) {
+	vsix := makeVSIX(t, map[string]string{
+		"extension/package.json":  `{"name":"test-ext"}`,
+		"extension/dist/index.js": `eval("bad")`,
+		"extension/README.md":     "ignored",
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(vsix)
+	}))
+	defer srv.Close()
+
+	c := New()
+	js, manifest, err := c.DownloadVSIX(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if manifest != `{"name":"test-ext"}` {
+		t.Errorf("manifest = %q, want {\"name\":\"test-ext\"}", manifest)
+	}
+	if _, ok := js["extension/dist/index.js"]; !ok {
+		t.Errorf("expected extension/dist/index.js in js map, got keys %v", keys(js))
+	}
+	if _, ok := js["extension/README.md"]; ok {
+		t.Errorf("README.md should not appear in js map")
+	}
+}
+
+func TestDownloadVSIX_sizeLimit(t *testing.T) {
+	// Serve a body that exceeds the limit passed to fetchBytes.
+	const smallLimit = 64
+	big := bytes.Repeat([]byte("x"), smallLimit+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(big)
+	}))
+	defer srv.Close()
+
+	c := New()
+	_, err := c.fetchBytes(context.Background(), srv.URL, smallLimit)
+	if err == nil {
+		t.Fatal("expected size-limit error, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds size limit") {
+		t.Errorf("error %q does not mention size limit", err)
+	}
+}
+
+func TestDownloadVSIX_badStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New()
+	_, _, err := c.DownloadVSIX(context.Background(), srv.URL)
+	if err == nil {
+		t.Fatal("expected error for 404 response, got nil")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("error %q does not mention 404", err)
+	}
+}
+
+func keys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
 
 func TestPreviousVersionUniversal(t *testing.T) {
 	// Marketplace orders newest-first.
