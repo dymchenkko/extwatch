@@ -36,6 +36,11 @@ const (
 	// realistic source files. (A limitation noted in the README.)
 	maxJSFileBytes = 8 << 20 // 8 MiB
 
+	// maxVSIXBytes caps the raw .vsix download. The URL comes from the
+	// marketplace JSON response, so a compromised CDN could serve an
+	// arbitrarily large body without this limit.
+	maxVSIXBytes = 256 << 20 // 256 MiB
+
 	// queryFlags asks the marketplace to include version history and the file
 	// asset list (which carries the .vsix download URL). 51 == IncludeVersions |
 	// IncludeFiles | IncludeCategoryAndTags | IncludeVersionProperties.
@@ -190,33 +195,15 @@ func (c *Client) DownloadVSIX(ctx context.Context, url string) (js map[string]st
 	if url == "" {
 		return nil, "", fmt.Errorf("no .vsix download URL available")
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// archive/zip needs random access, so buffer the whole body first.
+	raw, err := c.fetchBytes(ctx, url, maxVSIXBytes)
 	if err != nil {
-		return nil, "", fmt.Errorf("build download request: %w", err)
+		return nil, "", err
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("download vsix: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("vsix download returned %s", resp.Status)
-	}
-
-	// archive/zip needs random access (io.ReaderAt + size), which a streaming
-	// HTTP body doesn't provide. Buffer the whole .vsix into memory first; for
-	// extension packages (single-digit MB) this is fine.
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("read vsix body: %w", err)
-	}
-
 	zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
 	if err != nil {
 		return nil, "", fmt.Errorf("open vsix as zip: %w", err)
 	}
-
 	js = make(map[string]string)
 	for _, f := range zr.File {
 		switch {
@@ -225,14 +212,36 @@ func (c *Client) DownloadVSIX(ctx context.Context, url string) (js map[string]st
 				manifest = content
 			}
 		case isJSFile(f.Name):
-			content, err := readZipFile(f)
-			if err != nil {
-				continue // one unreadable entry shouldn't sink the analysis
+			if content, err := readZipFile(f); err == nil {
+				js[f.Name] = content
 			}
-			js[f.Name] = content
 		}
 	}
 	return js, manifest, nil
+}
+
+// fetchBytes GETs url and returns the body, capped at maxVSIXBytes.
+func (c *Client) fetchBytes(ctx context.Context, url string, limit int) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build download request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("download vsix: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("vsix download returned %s", resp.Status)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
+	if err != nil {
+		return nil, fmt.Errorf("read vsix body: %w", err)
+	}
+	if len(raw) > limit {
+		return nil, fmt.Errorf("vsix exceeds size limit (%d MiB)", limit>>20)
+	}
+	return raw, nil
 }
 
 // readZipFile reads a single entry from a zip, bounded by maxJSFileBytes.
