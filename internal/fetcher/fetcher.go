@@ -41,6 +41,10 @@ const (
 	// arbitrarily large body without this limit.
 	maxVSIXBytes = 256 << 20 // 256 MiB
 
+	// maxDecompressedBytes caps the total uncompressed JS content extracted
+	// from a .vsix.
+	maxDecompressedBytes = 512 << 20 // 512 MiB across all files
+
 	// queryFlags asks the marketplace to include version history and the file
 	// asset list (which carries the .vsix download URL). 51 == IncludeVersions |
 	// IncludeFiles | IncludeCategoryAndTags | IncludeVersionProperties.
@@ -205,6 +209,7 @@ func (c *Client) DownloadVSIX(ctx context.Context, url string) (js map[string]st
 		return nil, "", fmt.Errorf("open vsix as zip: %w", err)
 	}
 	js = make(map[string]string)
+	var totalBytes int
 	for _, f := range zr.File {
 		switch {
 		case f.Name == vsixManifestPath:
@@ -212,9 +217,15 @@ func (c *Client) DownloadVSIX(ctx context.Context, url string) (js map[string]st
 				manifest = content
 			}
 		case isJSFile(f.Name):
-			if content, err := readZipFile(f); err == nil {
-				js[f.Name] = content
+			content, err := readZipFile(f)
+			if err != nil {
+				continue
 			}
+			totalBytes += len(content)
+			if totalBytes > maxDecompressedBytes {
+				return nil, "", fmt.Errorf("vsix decompressed content exceeds limit (%d MiB)", maxDecompressedBytes>>20)
+			}
+			js[f.Name] = content
 		}
 	}
 	return js, manifest, nil
