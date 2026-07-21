@@ -7,9 +7,9 @@
 package astscanner
 
 import (
+	"bytes"
 	"sort"
 	"strings"
-	"unsafe"
 
 	"github.com/tdewolff/parse/v2"
 	"github.com/tdewolff/parse/v2/js"
@@ -481,18 +481,14 @@ func (d *detector) position(nodeData []byte) (line int, snippet string) {
 	return line, snippet
 }
 
-// sliceOffset returns the byte offset of sub within src.
-// Both slices must share the same backing array — guaranteed here because
-// we pass one []byte allocation to both parse.NewInputBytes and sliceOffset.
+// sliceOffset returns the position of word sub in the file text src.
+// For example, if src is "hello eval(...)" and sub is "eval", it returns 6.
+// Returns -1 if sub is not found inside src.
 func sliceOffset(src, sub []byte) int {
 	if len(src) == 0 || len(sub) == 0 {
 		return -1
 	}
-	off := int(uintptr(unsafe.Pointer(&sub[0])) - uintptr(unsafe.Pointer(&src[0])))
-	if off < 0 || off >= len(src) {
-		return -1
-	}
-	return off
+	return bytes.Index(src, sub)
 }
 
 // lineOffsets returns the byte offset at which each line starts.
