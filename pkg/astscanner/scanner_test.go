@@ -3,7 +3,7 @@ package astscanner_test
 import (
 	"testing"
 
-	"github.com/dymchenkko/extwatch/internal/astscanner"
+	"github.com/dymchenkko/extwatch/pkg/astscanner"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────

@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dymchenkko/extwatch/internal/extension"
+	"github.com/dymchenkko/extwatch/pkg/extension"
 )
 
 // The local (current) version is already unzipped on disk by VS Code, so we

@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/gen2brain/beeep v0.11.2
+	github.com/tdewolff/parse/v2 v2.8.13
 )
 
 require (
@@ -17,6 +18,5 @@ require (
 	github.com/sergeymakinen/go-bmp v1.0.0 // indirect
 	github.com/sergeymakinen/go-ico v1.0.0-beta.0 // indirect
 	github.com/tadvi/systray v0.0.0-20190226123456-11a2b8fa57af // indirect
-	github.com/tdewolff/parse/v2 v2.8.13 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 )

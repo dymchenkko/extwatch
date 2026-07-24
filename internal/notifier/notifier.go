@@ -11,7 +11,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/dymchenkko/extwatch/internal/analyzer"
+	"github.com/dymchenkko/extwatch/pkg/analyzer"
 	"github.com/gen2brain/beeep"
 )
 

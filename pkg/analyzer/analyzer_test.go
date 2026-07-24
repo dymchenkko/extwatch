@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dymchenkko/extwatch/internal/extension"
+	"github.com/dymchenkko/extwatch/pkg/extension"
 )
 
 func TestAnalyzeDiff(t *testing.T) {

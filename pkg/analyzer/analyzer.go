@@ -10,8 +10,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/dymchenkko/extwatch/internal/astscanner"
-	"github.com/dymchenkko/extwatch/internal/extension"
+	"github.com/dymchenkko/extwatch/pkg/astscanner"
+	"github.com/dymchenkko/extwatch/pkg/extension"
 )
 
 // Severity ranks how alarming a pattern is. Higher value == more dangerous.

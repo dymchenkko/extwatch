@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dymchenkko/extwatch/internal/extension"
+	"github.com/dymchenkko/extwatch/pkg/extension"
 )
 
 // makeVSIX builds a minimal in-memory .vsix (zip) with the given entries

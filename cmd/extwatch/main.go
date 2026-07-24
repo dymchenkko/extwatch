@@ -23,8 +23,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dymchenkko/extwatch/internal/analyzer"
-	"github.com/dymchenkko/extwatch/internal/extension"
+	"github.com/dymchenkko/extwatch/pkg/analyzer"
+	"github.com/dymchenkko/extwatch/pkg/extension"
 	"github.com/dymchenkko/extwatch/internal/fetcher"
 	"github.com/dymchenkko/extwatch/internal/notifier"
 	"github.com/dymchenkko/extwatch/internal/vsconfig"

@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dymchenkko/extwatch/internal/extension"
+	"github.com/dymchenkko/extwatch/pkg/extension"
 	"github.com/fsnotify/fsnotify"
 )
 
