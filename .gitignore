@@ -1,6 +1,10 @@
 # Compiled binary
 /extwatch
 
+# Go workspace file — local only
+go.work
+go.work.sum
+
 # Test/build artifacts
 *.out
 *.test
